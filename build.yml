@@ -1,0 +1,1234 @@
+name: Build APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Create project and write sources
+        run: |
+          set -e
+          flutter create --org com.example --project-name dlmanager app
+          cd app
+          rm -rf test lib/*
+          mkdir -p lib/models lib/services lib/screens
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
+          sed -i 's|<application|<application android:usesCleartextTraffic="true"|' android/app/src/main/AndroidManifest.xml
+          cat > pubspec.yaml <<'DART_EOF'
+          name: dlmanager
+          description: مدير تحميلات بنمط ADM
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.0.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            dio: ^5.4.0
+            path_provider: ^2.1.2
+            shared_preferences: ^2.2.2
+            open_filex: ^4.4.0
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+          DART_EOF
+          cat > lib/main.dart <<'DART_EOF'
+          import 'package:flutter/material.dart';
+          import 'screens/home_screen.dart';
+          import 'services/download_manager.dart';
+          import 'theme.dart';
+
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await manager.init();
+            runApp(const DlApp());
+          }
+
+          class DlApp extends StatelessWidget {
+            const DlApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'مدير التحميلات',
+                debugShowCheckedModeBanner: false,
+                theme: buildTheme(),
+                builder: (context, child) =>
+                    Directionality(textDirection: TextDirection.rtl, child: child!),
+                home: const HomeScreen(),
+              );
+            }
+          }
+          DART_EOF
+          cat > lib/models/download_item.dart <<'DART_EOF'
+          enum DlStatus { queued, downloading, paused, completed, failed }
+
+          class DownloadItem {
+            DownloadItem({
+              required this.id,
+              required this.url,
+              required this.name,
+              required this.path,
+              required this.connections,
+              this.total = 0,
+              this.status = DlStatus.queued,
+              List<int>? segDone,
+              this.resumable = true,
+              this.error,
+              DateTime? createdAt,
+            })  : segDone = segDone ?? [],
+                  createdAt = createdAt ?? DateTime.now();
+
+            final String id;
+            final String url;
+            String name;
+            String path;
+            int connections;
+            int total;
+            DlStatus status;
+            List<int> segDone;
+            bool resumable;
+            String? error;
+            final DateTime createdAt;
+
+            /// bytes/second, محسوبة أثناء التحميل فقط ولا تُحفظ.
+            double speed = 0;
+
+            int get done => segDone.fold(0, (a, b) => a + b);
+            double get progress => total > 0 ? (done / total).clamp(0.0, 1.0) : 0.0;
+            int get segCount => resumable ? connections : 1;
+
+            int segStart(int i) => (total ~/ segCount) * i;
+            int segEnd(int i) =>
+                i == segCount - 1 ? total - 1 : (total ~/ segCount) * (i + 1) - 1;
+            double segProgress(int i) {
+              if (!resumable || total == 0 || i >= segDone.length) return 0;
+              final len = segEnd(i) - segStart(i) + 1;
+              return (segDone[i] / len).clamp(0.0, 1.0);
+            }
+
+            Duration? get eta {
+              if (speed <= 1 || total == 0) return null;
+              return Duration(seconds: ((total - done) / speed).round());
+            }
+
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'url': url,
+                  'name': name,
+                  'path': path,
+                  'connections': connections,
+                  'total': total,
+                  'status': status.name,
+                  'segDone': segDone,
+                  'resumable': resumable,
+                  'error': error,
+                  'createdAt': createdAt.toIso8601String(),
+                };
+
+            factory DownloadItem.fromJson(Map<String, dynamic> j) => DownloadItem(
+                  id: j['id'] as String,
+                  url: j['url'] as String,
+                  name: j['name'] as String,
+                  path: j['path'] as String,
+                  connections: j['connections'] as int,
+                  total: j['total'] as int,
+                  status: DlStatus.values.byName(j['status'] as String),
+                  segDone: (j['segDone'] as List).cast<int>(),
+                  resumable: j['resumable'] as bool,
+                  error: j['error'] as String?,
+                  createdAt: DateTime.parse(j['createdAt'] as String),
+                );
+          }
+          DART_EOF
+          cat > lib/screens/add_screen.dart <<'DART_EOF'
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+
+          import '../services/download_manager.dart';
+          import '../theme.dart';
+          import '../utils.dart';
+
+          class AddScreen extends StatefulWidget {
+            const AddScreen({super.key});
+
+            @override
+            State<AddScreen> createState() => _AddScreenState();
+          }
+
+          class _AddScreenState extends State<AddScreen> {
+            final _url = TextEditingController();
+            final _name = TextEditingController();
+            bool _nameEdited = false;
+            int _connections = 4;
+            String? _error;
+
+            @override
+            void dispose() {
+              _url.dispose();
+              _name.dispose();
+              super.dispose();
+            }
+
+            void _onUrlChanged(String v) {
+              if (!_nameEdited) _name.text = v.trim().isEmpty ? '' : nameFromUrl(v);
+              if (_error != null) setState(() => _error = null);
+            }
+
+            Future<void> _paste() async {
+              final data = await Clipboard.getData(Clipboard.kTextPlain);
+              final text = data?.text?.trim();
+              if (text != null && text.isNotEmpty) {
+                _url.text = text;
+                _onUrlChanged(text);
+              }
+            }
+
+            void _start() {
+              final uri = Uri.tryParse(_url.text.trim());
+              if (uri == null ||
+                  !(uri.scheme == 'http' || uri.scheme == 'https') ||
+                  uri.host.isEmpty) {
+                setState(() => _error = 'اكتب رابطاً صحيحاً يبدأ بـ http أو https');
+                return;
+              }
+              final name = _name.text.trim().isEmpty
+                  ? nameFromUrl(_url.text)
+                  : _name.text.trim();
+              manager.add(_url.text, name, _connections);
+              Navigator.pop(context);
+            }
+
+            InputDecoration _dec({String? error}) => InputDecoration(
+                  filled: true,
+                  fillColor: Colors.white,
+                  errorText: error,
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: const BorderSide(color: Color(0xFFC9D2DA))),
+                  enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: const BorderSide(color: Color(0xFFC9D2DA))),
+                );
+
+            Widget _label(String t) => Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(t,
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                );
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                    title: const Text('رابط جديد',
+                        style: TextStyle(fontWeight: FontWeight.w700))),
+                body: ListView(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+                  children: [
+                    _label('رابط الملف'),
+                    Row(children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _url,
+                          onChanged: _onUrlChanged,
+                          keyboardType: TextInputType.url,
+                          textDirection: TextDirection.ltr,
+                          decoration: _dec(error: _error),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton.outlined(
+                          tooltip: 'لصق من الحافظة',
+                          onPressed: _paste,
+                          icon: const Icon(Icons.content_paste)),
+                    ]),
+                    const SizedBox(height: 18),
+                    _label('الاسم'),
+                    TextField(
+                      controller: _name,
+                      onChanged: (_) => _nameEdited = true,
+                      textDirection: TextDirection.ltr,
+                      decoration: _dec(),
+                    ),
+                    const SizedBox(height: 18),
+                    _label('مكان الحفظ'),
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: const Color(0xFFC9D2DA))),
+                      child: Directionality(
+                        textDirection: TextDirection.ltr,
+                        child: Text(manager.dir.path,
+                            style: const TextStyle(fontSize: 12, color: kMuted)),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        _label('عدد الاتصالات المتوازية'),
+                        const Text('أسرع بتقسيم الملف',
+                            style: TextStyle(fontSize: 12, color: kMuted)),
+                      ],
+                    ),
+                    Directionality(
+                      textDirection: TextDirection.ltr,
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: SegmentedButton<int>(
+                          showSelectedIcon: false,
+                          segments: const [
+                            ButtonSegment(value: 1, label: Text('1')),
+                            ButtonSegment(value: 2, label: Text('2')),
+                            ButtonSegment(value: 4, label: Text('4')),
+                            ButtonSegment(value: 8, label: Text('8')),
+                          ],
+                          selected: {_connections},
+                          onSelectionChanged: (s) =>
+                              setState(() => _connections = s.first),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 28),
+                    Row(children: [
+                      OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                            minimumSize: const Size(90, 52),
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14))),
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('إلغاء'),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                              minimumSize: const Size(0, 52),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14))),
+                          onPressed: _start,
+                          icon: const Icon(Icons.download),
+                          label: const Text('ابدأ التحميل',
+                              style:
+                                  TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                        ),
+                      ),
+                    ]),
+                  ],
+                ),
+              );
+            }
+          }
+          DART_EOF
+          cat > lib/screens/details_screen.dart <<'DART_EOF'
+          import 'package:flutter/material.dart';
+          import 'package:open_filex/open_filex.dart';
+
+          import '../models/download_item.dart';
+          import '../services/download_manager.dart';
+          import '../theme.dart';
+          import '../utils.dart';
+
+          class DetailsScreen extends StatelessWidget {
+            const DetailsScreen({super.key, required this.item});
+            final DownloadItem item;
+
+            Widget _stat(String label, String value) => Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(color: kBorder)),
+                    child: Column(children: [
+                      Text(label, style: const TextStyle(fontSize: 12, color: kMuted)),
+                      const SizedBox(height: 4),
+                      Directionality(
+                        textDirection: TextDirection.ltr,
+                        child: Text(value,
+                            style: const TextStyle(
+                                fontSize: 15, fontWeight: FontWeight.w700)),
+                      ),
+                    ]),
+                  ),
+                );
+
+            Widget _row(String k, String v) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(k, style: const TextStyle(fontSize: 13)),
+                      const SizedBox(width: 16),
+                      Flexible(
+                        child: Directionality(
+                          textDirection: TextDirection.ltr,
+                          child: Text(v,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 13)),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                    title: const Text('تفاصيل التحميل',
+                        style: TextStyle(fontWeight: FontWeight.w700))),
+                body: ListenableBuilder(
+                  listenable: manager,
+                  builder: (context, _) {
+                    final it = item;
+                    final eta = it.eta;
+                    final host = Uri.tryParse(it.url)?.host ?? it.url;
+                    return ListView(
+                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+                      children: [
+                        Directionality(
+                          textDirection: TextDirection.ltr,
+                          child: Text(it.name,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                  fontSize: 16, fontWeight: FontWeight.w600)),
+                        ),
+                        const SizedBox(height: 20),
+                        Center(
+                          child: SizedBox(
+                            width: 184,
+                            height: 184,
+                            child: Stack(alignment: Alignment.center, children: [
+                              SizedBox.expand(
+                                child: CircularProgressIndicator(
+                                  value: it.total > 0 ? it.progress : null,
+                                  strokeWidth: 14,
+                                  strokeCap: StrokeCap.round,
+                                  backgroundColor: kBorder,
+                                ),
+                              ),
+                              Directionality(
+                                textDirection: TextDirection.ltr,
+                                child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text('${(it.progress * 100).floor()}%',
+                                          style: const TextStyle(
+                                              fontSize: 38, fontWeight: FontWeight.w700)),
+                                      Text(
+                                          '${fmtBytes(it.done)} / ${it.total > 0 ? fmtBytes(it.total) : '؟'}',
+                                          style: const TextStyle(
+                                              fontSize: 13, color: kMuted)),
+                                    ]),
+                              ),
+                            ]),
+                          ),
+                        ),
+                        if (it.status == DlStatus.failed && it.error != null) ...[
+                          const SizedBox(height: 12),
+                          Text(it.error!,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(color: kError)),
+                        ],
+                        const SizedBox(height: 20),
+                        Row(children: [
+                          _stat('السرعة', fmtSpeed(it.speed)),
+                          const SizedBox(width: 10),
+                          _stat('المتبقي', eta != null ? fmtEta(eta) : '—'),
+                          const SizedBox(width: 10),
+                          _stat('الاتصالات', '${it.segCount}'),
+                        ]),
+                        const SizedBox(height: 16),
+                        Container(
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(16),
+                              border: Border.all(color: kBorder)),
+                          child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('أجزاء الملف',
+                                    style: TextStyle(
+                                        fontSize: 13, fontWeight: FontWeight.w600)),
+                                const SizedBox(height: 10),
+                                Directionality(
+                                  textDirection: TextDirection.ltr,
+                                  child: Row(children: [
+                                    for (var i = 0; i < it.segCount; i++)
+                                      Expanded(
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                              horizontal: 2),
+                                          child: ClipRRect(
+                                            borderRadius: BorderRadius.circular(5),
+                                            child: LinearProgressIndicator(
+                                              value: it.resumable
+                                                  ? it.segProgress(i)
+                                                  : it.progress,
+                                              minHeight: 10,
+                                              backgroundColor: kBorder,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                  ]),
+                                ),
+                                const Divider(height: 24, color: kBorder),
+                                _row('المصدر', host),
+                                _row('مكان الحفظ', it.path),
+                                _row('الاستئناف', it.resumable ? 'مدعوم' : 'غير مدعوم'),
+                              ]),
+                        ),
+                        const SizedBox(height: 24),
+                        Row(children: [
+                          OutlinedButton(
+                            style: OutlinedButton.styleFrom(
+                                foregroundColor: kError,
+                                minimumSize: const Size(90, 52),
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14))),
+                            onPressed: () => _confirmDelete(context),
+                            child: Text(it.status == DlStatus.completed ? 'حذف' : 'إلغاء'),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(child: _mainButton(it)),
+                        ]),
+                      ],
+                    );
+                  },
+                ),
+              );
+            }
+
+            Widget _mainButton(DownloadItem it) {
+              late IconData icon;
+              late String label;
+              late VoidCallback? onTap;
+              switch (it.status) {
+                case DlStatus.downloading:
+                  icon = Icons.pause;
+                  label = 'إيقاف مؤقت';
+                  onTap = () => manager.pause(it);
+                  break;
+                case DlStatus.completed:
+                  icon = Icons.open_in_new;
+                  label = 'فتح الملف';
+                  onTap = () => OpenFilex.open(it.path);
+                  break;
+                case DlStatus.failed:
+                  icon = Icons.refresh;
+                  label = 'إعادة المحاولة';
+                  onTap = () => manager.resume(it);
+                  break;
+                default:
+                  icon = Icons.play_arrow;
+                  label = 'متابعة';
+                  onTap = () => manager.resume(it);
+              }
+              return FilledButton.icon(
+                style: FilledButton.styleFrom(
+                    minimumSize: const Size(0, 52),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14))),
+                onPressed: onTap,
+                icon: Icon(icon),
+                label: Text(label,
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+              );
+            }
+
+            Future<void> _confirmDelete(BuildContext context) async {
+              final ok = await showDialog<bool>(
+                context: context,
+                builder: (_) => Directionality(
+                  textDirection: TextDirection.rtl,
+                  child: AlertDialog(
+                    title: const Text('تأكيد'),
+                    content: const Text('رح يتم حذف التحميل مع الملف. متأكد؟'),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('تراجع')),
+                      TextButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          child: const Text('حذف')),
+                    ],
+                  ),
+                ),
+              );
+              if (ok == true && context.mounted) {
+                Navigator.pop(context);
+                manager.remove(item);
+              }
+            }
+          }
+          DART_EOF
+          cat > lib/screens/home_screen.dart <<'DART_EOF'
+          import 'package:flutter/material.dart';
+          import 'package:open_filex/open_filex.dart';
+
+          import '../models/download_item.dart';
+          import '../services/download_manager.dart';
+          import '../theme.dart';
+          import '../utils.dart';
+          import 'add_screen.dart';
+          import 'details_screen.dart';
+
+          class HomeScreen extends StatefulWidget {
+            const HomeScreen({super.key});
+
+            @override
+            State<HomeScreen> createState() => _HomeScreenState();
+          }
+
+          class _HomeScreenState extends State<HomeScreen> {
+            int _filter = 0; // 0 الكل، 1 قيد التحميل، 2 مكتملة
+
+            bool _match(DownloadItem e) {
+              switch (_filter) {
+                case 1:
+                  return e.status != DlStatus.completed;
+                case 2:
+                  return e.status == DlStatus.completed;
+                default:
+                  return true;
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                floatingActionButton: FloatingActionButton.extended(
+                  onPressed: () => Navigator.push(
+                      context, MaterialPageRoute(builder: (_) => const AddScreen())),
+                  icon: const Icon(Icons.add),
+                  label: const Text('رابط جديد'),
+                ),
+                body: SafeArea(
+                  child: ListenableBuilder(
+                    listenable: manager,
+                    builder: (context, _) {
+                      final list = manager.items.where(_match).toList();
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Padding(
+                            padding: EdgeInsets.fromLTRB(20, 20, 20, 12),
+                            child: Text('التحميلات',
+                                style: TextStyle(
+                                    fontSize: 26,
+                                    fontWeight: FontWeight.w700,
+                                    color: kText)),
+                          ),
+                          _SummaryCard(),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                            child: Wrap(spacing: 8, children: [
+                              for (final (i, label) in ['الكل', 'قيد التحميل', 'مكتملة']
+                                  .indexed)
+                                ChoiceChip(
+                                  label: Text(label),
+                                  selected: _filter == i,
+                                  onSelected: (_) => setState(() => _filter = i),
+                                ),
+                            ]),
+                          ),
+                          Expanded(
+                            child: list.isEmpty
+                                ? const Center(
+                                    child: Text('ما في تحميلات بعد.\nاضغط "رابط جديد" لتبدأ.',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(color: kMuted, height: 1.6)))
+                                : ListView.separated(
+                                    padding: const EdgeInsets.fromLTRB(20, 4, 20, 96),
+                                    itemCount: list.length,
+                                    separatorBuilder: (_, __) =>
+                                        const SizedBox(height: 10),
+                                    itemBuilder: (_, i) => _Tile(item: list[i]),
+                                  ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              );
+            }
+          }
+
+          class _SummaryCard extends StatelessWidget {
+            @override
+            Widget build(BuildContext context) {
+              return Container(
+                margin: const EdgeInsets.symmetric(horizontal: 20),
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                    color: kAccent, borderRadius: BorderRadius.circular(20)),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('السرعة الإجمالية',
+                          style: TextStyle(color: Colors.white, fontSize: 13)),
+                      Directionality(
+                        textDirection: TextDirection.ltr,
+                        child: Text(fmtSpeed(manager.totalSpeed),
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 28,
+                                fontWeight: FontWeight.w700)),
+                      ),
+                    ]),
+                    Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                      Text('${manager.activeCount} قيد التحميل',
+                          style: const TextStyle(color: Colors.white, fontSize: 13)),
+                      const SizedBox(height: 4),
+                      Text('${manager.completedCount} مكتمل',
+                          style: const TextStyle(color: Colors.white, fontSize: 13)),
+                    ]),
+                  ],
+                ),
+              );
+            }
+          }
+
+          IconData _iconFor(String name) {
+            final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+            if (['mp4', 'mkv', 'avi', 'mov', 'webm'].contains(ext)) {
+              return Icons.movie_outlined;
+            }
+            if (['mp3', 'wav', 'flac', 'm4a', 'ogg'].contains(ext)) {
+              return Icons.audiotrack_outlined;
+            }
+            if (['zip', 'rar', '7z', 'tar', 'gz'].contains(ext)) {
+              return Icons.folder_zip_outlined;
+            }
+            if (['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(ext)) {
+              return Icons.image_outlined;
+            }
+            if (ext == 'apk') return Icons.android;
+            return Icons.insert_drive_file_outlined;
+          }
+
+          class _Tile extends StatelessWidget {
+            const _Tile({required this.item});
+            final DownloadItem item;
+
+            Color get _color {
+              switch (item.status) {
+                case DlStatus.completed:
+                  return kDone;
+                case DlStatus.paused:
+                  return kPaused;
+                case DlStatus.failed:
+                  return kError;
+                default:
+                  return kAccent;
+              }
+            }
+
+            String get _statusText {
+              switch (item.status) {
+                case DlStatus.completed:
+                  return 'اكتمل · ${fmtBytes(item.total)}';
+                case DlStatus.paused:
+                  return 'متوقف مؤقتاً';
+                case DlStatus.failed:
+                  return item.error ?? 'فشل التحميل';
+                case DlStatus.queued:
+                  return 'بالانتظار…';
+                case DlStatus.downloading:
+                  final eta = item.eta;
+                  return '${fmtSpeed(item.speed)}${eta != null ? ' · ${fmtEta(eta)}' : ''}';
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final done = item.status == DlStatus.completed;
+              return Material(
+                color: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  side: const BorderSide(color: kBorder),
+                ),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(16),
+                  onTap: () => Navigator.push(context,
+                      MaterialPageRoute(builder: (_) => DetailsScreen(item: item))),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Row(children: [
+                      Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                            color: _color.withOpacity(.12),
+                            borderRadius: BorderRadius.circular(12)),
+                        child: Icon(done ? Icons.check : _iconFor(item.name),
+                            color: _color),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Directionality(
+                            textDirection: TextDirection.ltr,
+                            child: Align(
+                              alignment: Alignment.centerRight,
+                              child: Text(item.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                      fontSize: 15, fontWeight: FontWeight.w600)),
+                            ),
+                          ),
+                          if (!done) ...[
+                            const SizedBox(height: 8),
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(3),
+                              child: LinearProgressIndicator(
+                                value: item.total > 0 ? item.progress : null,
+                                minHeight: 6,
+                                color: _color,
+                                backgroundColor: kBorder,
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 6),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Flexible(
+                                child: Text(_statusText,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style:
+                                        const TextStyle(fontSize: 12, color: kMuted)),
+                              ),
+                              if (!done && item.total > 0)
+                                Directionality(
+                                  textDirection: TextDirection.ltr,
+                                  child: Text(
+                                      '${fmtBytes(item.done)} / ${fmtBytes(item.total)}',
+                                      style:
+                                          const TextStyle(fontSize: 12, color: kMuted)),
+                                ),
+                            ],
+                          ),
+                        ]),
+                      ),
+                      _action(),
+                    ]),
+                  ),
+                ),
+              );
+            }
+
+            Widget _action() {
+              switch (item.status) {
+                case DlStatus.downloading:
+                  return IconButton(
+                      tooltip: 'إيقاف مؤقت',
+                      onPressed: () => manager.pause(item),
+                      icon: const Icon(Icons.pause));
+                case DlStatus.paused:
+                case DlStatus.failed:
+                  return IconButton(
+                      tooltip: item.status == DlStatus.failed ? 'إعادة المحاولة' : 'متابعة',
+                      onPressed: () => manager.resume(item),
+                      icon: Icon(item.status == DlStatus.failed
+                          ? Icons.refresh
+                          : Icons.play_arrow));
+                case DlStatus.completed:
+                  return IconButton(
+                      tooltip: 'فتح',
+                      onPressed: () => OpenFilex.open(item.path),
+                      icon: const Icon(Icons.open_in_new));
+                default:
+                  return const SizedBox(width: 48);
+              }
+            }
+          }
+          DART_EOF
+          cat > lib/services/download_manager.dart <<'DART_EOF'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+
+          import 'package:dio/dio.dart';
+          import 'package:flutter/foundation.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          import '../models/download_item.dart';
+
+          /// نسخة واحدة تُستخدم في كل التطبيق.
+          final DownloadManager manager = DownloadManager();
+
+          class DownloadManager extends ChangeNotifier {
+            final Dio _dio = Dio(BaseOptions(
+              connectTimeout: const Duration(seconds: 20),
+              receiveTimeout: const Duration(seconds: 30),
+              followRedirects: true,
+            ));
+
+            final List<DownloadItem> items = [];
+            final Map<String, CancelToken> _tokens = {};
+            final Map<String, int> _lastDone = {};
+            Timer? _ticker;
+            int _ticks = 0;
+            late Directory dir;
+
+            // ---------- التهيئة والحفظ ----------
+
+            Future<void> init() async {
+              Directory base;
+              try {
+                base = await getExternalStorageDirectory() ??
+                    await getApplicationDocumentsDirectory();
+              } catch (_) {
+                base = await getApplicationDocumentsDirectory();
+              }
+              dir = Directory('${base.path}/Downloads');
+              await dir.create(recursive: true);
+
+              final prefs = await SharedPreferences.getInstance();
+              final raw = prefs.getString('items');
+              if (raw != null) {
+                for (final m in jsonDecode(raw) as List) {
+                  final it = DownloadItem.fromJson(m as Map<String, dynamic>);
+                  if (it.status == DlStatus.downloading || it.status == DlStatus.queued) {
+                    it.status = DlStatus.paused;
+                  }
+                  items.add(it);
+                }
+              }
+            }
+
+            Future<void> _save() async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString(
+                  'items', jsonEncode(items.map((e) => e.toJson()).toList()));
+            }
+
+            // ---------- إحصائيات ----------
+
+            double get totalSpeed => items
+                .where((e) => e.status == DlStatus.downloading)
+                .fold(0.0, (a, b) => a + b.speed);
+            int get activeCount =>
+                items.where((e) => e.status == DlStatus.downloading).length;
+            int get completedCount =>
+                items.where((e) => e.status == DlStatus.completed).length;
+
+            // ---------- العمليات ----------
+
+            String _uniqueName(String name) {
+              var candidate = name.isEmpty ? 'file' : name;
+              final dot = candidate.lastIndexOf('.');
+              final stem = dot > 0 ? candidate.substring(0, dot) : candidate;
+              final ext = dot > 0 ? candidate.substring(dot) : '';
+              var n = 1;
+              while (File('${dir.path}/$candidate').existsSync() ||
+                  items.any((e) => e.name == candidate)) {
+                candidate = '$stem ($n)$ext';
+                n++;
+              }
+              return candidate;
+            }
+
+            Future<DownloadItem> add(String url, String name, int connections) async {
+              final safe = _uniqueName(name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_'));
+              final it = DownloadItem(
+                id: DateTime.now().microsecondsSinceEpoch.toString(),
+                url: url.trim(),
+                name: safe,
+                path: '${dir.path}/$safe',
+                connections: connections,
+              );
+              items.insert(0, it);
+              await _save();
+              notifyListeners();
+              start(it);
+              return it;
+            }
+
+            Future<void> start(DownloadItem it) async {
+              if (_tokens.containsKey(it.id)) return;
+              final token = CancelToken();
+              _tokens[it.id] = token;
+              it.status = DlStatus.downloading;
+              it.error = null;
+              _lastDone[it.id] = it.done;
+              _ensureTicker();
+              notifyListeners();
+
+              try {
+                if (it.total == 0) await _probe(it, token);
+
+                if (it.segDone.length != it.segCount) {
+                  it.segDone = List.filled(it.segCount, 0);
+                }
+                // نزامن التقدم مع ما هو موجود فعلاً على القرص
+                for (var i = 0; i < it.segCount; i++) {
+                  final f = File('${it.path}.part$i');
+                  if (!it.resumable && f.existsSync()) f.deleteSync();
+                  it.segDone[i] = f.existsSync() ? f.lengthSync() : 0;
+                }
+                _lastDone[it.id] = it.done;
+
+                await Future.wait(
+                  [for (var i = 0; i < it.segCount; i++) _segment(it, i, token)],
+                  eagerError: true,
+                );
+
+                await _merge(it);
+                it.status = DlStatus.completed;
+                it.speed = 0;
+              } on DioException catch (e) {
+                if (!CancelToken.isCancel(e)) {
+                  token.cancel();
+                  it.status = DlStatus.failed;
+                  it.error = _friendly(e);
+                }
+              } catch (e) {
+                token.cancel();
+                it.status = DlStatus.failed;
+                it.error = e.toString().replaceFirst('Exception: ', '');
+              } finally {
+                _tokens.remove(it.id);
+                await _save();
+                notifyListeners();
+              }
+            }
+
+            String _friendly(DioException e) {
+              switch (e.type) {
+                case DioExceptionType.connectionTimeout:
+                case DioExceptionType.receiveTimeout:
+                case DioExceptionType.sendTimeout:
+                  return 'انتهت مهلة الاتصال';
+                case DioExceptionType.connectionError:
+                  return 'تعذر الاتصال بالخادم';
+                case DioExceptionType.badResponse:
+                  return 'رد الخادم: ${e.response?.statusCode}';
+                default:
+                  return 'فشل التحميل';
+              }
+            }
+
+            /// نسأل الخادم عن الحجم وهل يدعم التحميل المجزأ (Range).
+            Future<void> _probe(DownloadItem it, CancelToken t) async {
+              final r = await _dio.get<ResponseBody>(
+                it.url,
+                cancelToken: t,
+                options: Options(
+                  responseType: ResponseType.stream,
+                  headers: {'Range': 'bytes=0-0'},
+                ),
+              );
+              final cr = r.headers.value('content-range');
+              if (r.statusCode == 206 && cr != null && cr.contains('/')) {
+                it.total = int.tryParse(cr.split('/').last) ?? 0;
+                it.resumable = it.total > 0;
+              } else {
+                it.total = int.tryParse(r.headers.value('content-length') ?? '') ?? 0;
+                it.resumable = false;
+              }
+              if (it.total > 0 && it.total < 1024 * 1024) it.connections = 1;
+              // نغلق الاتصال بدون قراءة الملف كله
+              final sub = r.data!.stream.listen((_) {});
+              await sub.cancel();
+            }
+
+            Future<void> _segment(DownloadItem it, int i, CancelToken t) async {
+              final part = File('${it.path}.part$i');
+              var done = it.segDone[i];
+              final headers = <String, String>{};
+
+              if (it.resumable) {
+                final len = it.segEnd(i) - it.segStart(i) + 1;
+                if (done >= len) return;
+                headers['Range'] = 'bytes=${it.segStart(i) + done}-${it.segEnd(i)}';
+              }
+
+              final r = await _dio.get<ResponseBody>(
+                it.url,
+                cancelToken: t,
+                options: Options(responseType: ResponseType.stream, headers: headers),
+              );
+              if (it.resumable && r.statusCode != 206) {
+                throw Exception('الخادم لا يدعم التحميل المجزأ');
+              }
+
+              final sink =
+                  part.openWrite(mode: it.resumable ? FileMode.append : FileMode.write);
+              try {
+                await for (final chunk in r.data!.stream) {
+                  sink.add(chunk);
+                  done += chunk.length;
+                  it.segDone[i] = done;
+                }
+              } finally {
+                await sink.close();
+              }
+            }
+
+            Future<void> _merge(DownloadItem it) async {
+              final out = File(it.path).openWrite();
+              try {
+                for (var i = 0; i < it.segCount; i++) {
+                  await out.addStream(File('${it.path}.part$i').openRead());
+                }
+              } finally {
+                await out.close();
+              }
+              for (var i = 0; i < it.segCount; i++) {
+                final f = File('${it.path}.part$i');
+                if (f.existsSync()) f.deleteSync();
+              }
+              if (it.total == 0) it.total = it.done;
+            }
+
+            void pause(DownloadItem it) {
+              if (it.status != DlStatus.downloading) return;
+              it.status = DlStatus.paused;
+              it.speed = 0;
+              _tokens[it.id]?.cancel();
+              _save();
+              notifyListeners();
+            }
+
+            void resume(DownloadItem it) => start(it);
+
+            Future<void> remove(DownloadItem it, {bool deleteFile = true}) async {
+              _tokens[it.id]?.cancel();
+              items.remove(it);
+              notifyListeners();
+              await Future.delayed(const Duration(milliseconds: 300));
+              if (deleteFile) {
+                for (var i = 0; i < 16; i++) {
+                  final f = File('${it.path}.part$i');
+                  if (f.existsSync()) f.deleteSync();
+                }
+                final f = File(it.path);
+                if (f.existsSync()) f.deleteSync();
+              }
+              await _save();
+            }
+
+            // ---------- حساب السرعة ----------
+
+            void _ensureTicker() {
+              _ticker ??= Timer.periodic(const Duration(milliseconds: 500), (_) {
+                var active = false;
+                for (final it in items) {
+                  if (it.status == DlStatus.downloading) {
+                    active = true;
+                    final last = _lastDone[it.id] ?? it.done;
+                    final d = it.done;
+                    final inst = (d - last) * 2.0;
+                    it.speed = it.speed == 0 ? inst : it.speed * 0.7 + inst * 0.3;
+                    _lastDone[it.id] = d;
+                  } else {
+                    it.speed = 0;
+                  }
+                }
+                notifyListeners();
+                if (++_ticks % 4 == 0) _save();
+                if (!active) {
+                  _ticker?.cancel();
+                  _ticker = null;
+                }
+              });
+            }
+          }
+          DART_EOF
+          cat > lib/theme.dart <<'DART_EOF'
+          import 'package:flutter/material.dart';
+
+          const kAccent = Color(0xFF0A6EBD);
+          const kBg = Color(0xFFF4F6F8);
+          const kText = Color(0xFF14202B);
+          const kMuted = Color(0xFF5B6B7A);
+          const kBorder = Color(0xFFE1E6EB);
+          const kPaused = Color(0xFFA24A00);
+          const kDone = Color(0xFF1A7F4B);
+          const kError = Color(0xFFB3261E);
+
+          ThemeData buildTheme() {
+            return ThemeData(
+              useMaterial3: true,
+              colorSchemeSeed: kAccent,
+              scaffoldBackgroundColor: kBg,
+              appBarTheme: const AppBarTheme(
+                backgroundColor: kBg,
+                foregroundColor: kText,
+                elevation: 0,
+                scrolledUnderElevation: 0,
+              ),
+            );
+          }
+          DART_EOF
+          cat > lib/utils.dart <<'DART_EOF'
+          String fmtBytes(num b) {
+            if (b < 1024) return '${b.toStringAsFixed(0)} B';
+            const units = ['KB', 'MB', 'GB', 'TB'];
+            double v = b / 1024;
+            int i = 0;
+            while (v >= 1024 && i < units.length - 1) {
+              v /= 1024;
+              i++;
+            }
+            return '${v.toStringAsFixed(v >= 100 ? 0 : 1)} ${units[i]}';
+          }
+
+          String fmtSpeed(num bytesPerSec) => '${fmtBytes(bytesPerSec)}/s';
+
+          String fmtEta(Duration d) {
+            String two(int n) => n.toString().padLeft(2, '0');
+            final h = d.inHours;
+            final m = d.inMinutes % 60;
+            final s = d.inSeconds % 60;
+            return h > 0 ? '$h:${two(m)}:${two(s)}' : '$m:${two(s)}';
+          }
+
+          String nameFromUrl(String url) {
+            try {
+              final uri = Uri.parse(url.trim());
+              final segs = uri.pathSegments.where((s) => s.isNotEmpty).toList();
+              if (segs.isEmpty) return 'file';
+              return Uri.decodeComponent(segs.last);
+            } catch (_) {
+              return 'file';
+            }
+          }
+          DART_EOF
+      - name: Build
+        run: |
+          cd app
+          flutter pub get
+          flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: download-manager-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
